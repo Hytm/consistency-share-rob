@@ -20,18 +20,23 @@ const (
 	WRITERS    = "WRITERS"
 )
 
+type check struct {
+	id  uuid.UUID
+	age int
+}
+
 func main() {
 	_ = godotenv.Load()
 	conn := connect()
 
-	id, err := prepare(conn)
+	ids, err := prepare(conn)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	update := make(chan int)
-	go write(conn, context.Background(), id, update)
-	go read(conn, context.Background(), id, update)
+	update := make(chan check)
+	go write(conn, context.Background(), ids, update)
+	go read(conn, context.Background(), update)
 
 	runtime.Goexit()
 	// wait for goroutines to finish
@@ -39,7 +44,7 @@ func main() {
 	disconnect(conn)
 }
 
-func write(conn *pgxpool.Pool, ctx context.Context, id uuid.UUID, update chan int) {
+func write(conn *pgxpool.Pool, ctx context.Context, ids []uuid.UUID, update chan check) {
 	var counter uint64
 	iter, err := strconv.Atoi(os.Getenv(ITERATIONS))
 	if err != nil {
@@ -65,15 +70,17 @@ func write(conn *pgxpool.Pool, ctx context.Context, id uuid.UUID, update chan in
 	wg := sync.WaitGroup{}
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			for age := 0; age < iterPerWorker; age++ {
+			start := iterPerWorker * i
+			limit := start + iterPerWorker
+			for age := start; age <= limit; age++ {
 				ctx := context.Background()
 				tx, err := conn.Begin(ctx)
 				if err != nil {
 					log.Fatal("writer:Failed to start transactions: ", err)
 				}
-				_, err = tx.Exec(ctx, "UPDATE users SET age = $1 WHERE id = $2", age, id)
+				_, err = tx.Exec(ctx, "UPDATE users SET age = $1 WHERE id = $2", age, ids[i])
 				if err != nil {
 					log.Fatal("writer: ", err)
 					tx.Rollback(ctx)
@@ -82,26 +89,26 @@ func write(conn *pgxpool.Pool, ctx context.Context, id uuid.UUID, update chan in
 				}
 				atomic.AddUint64(&counter, 1)
 				fmt.Printf("\r%d", atomic.LoadUint64(&counter))
-				update <- age
+				update <- check{age: age, id: ids[i]}
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 }
 
-func read(conn *pgxpool.Pool, ctx context.Context, id uuid.UUID, update <-chan int) {
-	for expectedAge := range update {
-		go handleRead(conn, ctx, id, expectedAge)
+func read(conn *pgxpool.Pool, ctx context.Context, update <-chan check) {
+	for check := range update {
+		go handleRead(conn, ctx, check)
 	}
 }
 
-func handleRead(conn *pgxpool.Pool, ctx context.Context, id uuid.UUID, expectedAge int) {
+func handleRead(conn *pgxpool.Pool, ctx context.Context, check check) {
 	var age int
-	err := conn.QueryRow(ctx, "SELECT age FROM users WHERE id = $1", id).Scan(&age)
+	err := conn.QueryRow(ctx, "SELECT age FROM users WHERE id = $1", check.id).Scan(&age)
 	if err != nil {
 		log.Fatal("reader: ", err)
 	}
-	if age < expectedAge {
-		log.Fatalf("expected %d, got %d", expectedAge, age)
+	if age < check.age {
+		log.Fatalf("expected %d, got %d on worker %d", check.age, age, check.id)
 	}
 }
